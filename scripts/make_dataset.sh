@@ -5,7 +5,7 @@ echo "-------------------------------------------------"
 echo "| Index DFDC dataset                            |"
 echo "-------------------------------------------------"
 # put your dfdc source directory path and uncomment the following line
-DFDC_SRC=/content/dfdc_train_part_00/dfdc_train_part_0
+DFDC_SRC=/content/training_data
 python index_dfdc.py --source $DFDC_SRC
 
 # echo ""
@@ -22,7 +22,7 @@ echo "-------------------------------------------------"
 echo "| Extract faces from DFDC                        |"
 echo "-------------------------------------------------"
 # put your source and destination directories and uncomment the following lines
-DFDC_SRC=/content/dfdc_train_part_00/dfdc_train_part_0
+DFDC_SRC=/content/training_data
 VIDEODF_SRC=/content/icpr2020dfdc/data/dfdc_videos.pkl
 FACES_DST=/content/faces
 FACESDF_DST=/content/faces-df

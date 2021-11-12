@@ -46,7 +46,7 @@ def parse_args(argv):
     parser.add_argument('--collateonly', help='Only perform collation of pre-existing results', action='store_true')
     parser.add_argument('--noindex', help='Do not rebuild the index', action='store_false')
     parser.add_argument('--batch', type=int, help='Batch size', default=16)
-    parser.add_argument('--threads', type=int, help='Number of threads', default=8)
+    parser.add_argument('--threads', type=int, help='Number of threads', default=4)
     parser.add_argument('--offset', type=int, help='Offset to start extraction', default=0)
     parser.add_argument('--num', type=int, help='Number of videos to process', default=0)
     parser.add_argument('--lazycheck', action='store_true', help='Lazy check of existing video indexes')

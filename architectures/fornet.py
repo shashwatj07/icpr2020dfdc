@@ -1,14 +1,3 @@
-"""
-Video Face Manipulation Detection Through Ensemble of CNNs
-
-Image and Sound Processing Lab - Politecnico di Milano
-
-Nicolò Bonettini
-Edoardo Daniele Cannas
-Sara Mandelli
-Luca Bondi
-Paolo Bestagini
-"""
 from collections import OrderedDict
 
 import torch
@@ -16,6 +5,7 @@ from efficientnet_pytorch import EfficientNet
 from torch import nn as nn
 from torch.nn import functional as F
 from torchvision import transforms
+from isplutils import utils
 
 from . import externals
 
@@ -243,3 +233,44 @@ class EfficientNetAutoAttB4ST(SiameseTuning):
 class XceptionST(SiameseTuning):
     def __init__(self):
         super(XceptionST, self).__init__(feat_ext=Xception, num_feat=2048, lastonly=True)
+
+"""
+Ensemble
+
+"""
+
+class Ensemble(nn.Module):
+  def __init__(self, nets, device):
+    super(Ensemble, self).__init__()
+    self.nets = nets
+    self.device = device
+    self.transfs = []
+    for net in nets:
+      transf = utils.get_transformer('scale', 224, net.get_normalizer(), train=False)
+      self.transfs.append(transf)
+    self.ensemble = nn.Sequential(
+      nn.Linear(3, 1),
+      nn.Sigmoid()
+    )
+
+  def forward(self, img):
+    # img=img.cpu().detach().numpy()
+    x = list(img.size())
+    print(x)
+    # imgs=[]
+    scores = []
+    for i in range(len(self.nets)):
+      net = self.nets[i]
+      faces_t = torch.stack( [img[i] for i in range(32)] )
+      faces_pred = torch.sigmoid(net(faces_t.to(self.device))).cpu().detach().numpy().flatten()
+      scores.append(faces_pred)
+    print(scores)
+    logits = []
+    for i in range(32):
+      logits.append(self.ensemble(torch.tensor([scores[0][i], scores[1][i], scores[2][i]]))[0])
+    print(logits)
+    return torch.tensor([logits], requires_grad=True).permute(1,0)
+
+  @staticmethod
+  def get_normalizer():
+    return transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])

@@ -1,4 +1,4 @@
-name: icpr2020
+name: ml-project
 channels:
   - pytorch
   - conda-forge

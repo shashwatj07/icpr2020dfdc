@@ -3,22 +3,29 @@ import os
 import shutil
 import warnings
 
+import albumentations as A
 import numpy as np
+import pandas as pd
 import torch
 import torch.multiprocessing
+from torchvision.transforms import ToPILImage, ToTensor
+
+
+from isplutils import utils, split
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 import torch.nn as nn
-import torch.optim as optim
+from albumentations.pytorch import ToTensorV2
+from sklearn.metrics import roc_auc_score
 from tensorboardX import SummaryWriter
+from torch import optim
 from torch.utils.data import DataLoader
+from torch.utils.model_zoo import load_url
 from tqdm import tqdm
+from PIL import ImageChops, Image
 
-from architectures import tripletnet
-from train_binclass import save_model, tb_attention
-from isplutils.data import FrameFaceIterableDataset
-from isplutils.data_siamese import FrameFaceTripletIterableDataset
-from isplutils import split, utils
+from architectures import fornet,weights
+from isplutils.data import FrameFaceIterableDataset, load_face
 
 
 def main():
@@ -45,7 +52,7 @@ def main():
                         choices=['scale', 'tight'])
     parser.add_argument('--size', type=int, help='Train patch size', required=True)
 
-    parser.add_argument('--batch', type=int, help='Batch size to fit in GPU memory', default=12)
+    parser.add_argument('--batch', type=int, help='Batch size to fit in GPU memory', default=32)
     parser.add_argument('--lr', type=float, default=1e-5, help='Learning rate')
     parser.add_argument('--valint', type=int, help='Validation interval (iterations)', default=500)
     parser.add_argument('--patience', type=int, help='Patience before dropping the LR [validation intervals]',
@@ -54,9 +61,9 @@ def main():
     parser.add_argument('--init', type=str, help='Weight initialization file')
     parser.add_argument('--scratch', action='store_true', help='Train from scratch')
 
-    parser.add_argument('--traintriplets', type=int, help='Limit the number of train triplets per epoch', default=-1)
-    parser.add_argument('--valtriplets', type=int, help='Limit the number of validation triplets per epoch',
-                        default=2000)
+    parser.add_argument('--trainsamples', type=int, help='Limit the number of train samples per epoch', default=-1)
+    parser.add_argument('--valsamples', type=int, help='Limit the number of validation samples per epoch',
+                        default=6000)
 
     parser.add_argument('--logint', type=int, help='Training log interval (iterations)', default=100)
     parser.add_argument('--workers', type=int, help='Num workers for data loaders', default=6)
@@ -68,19 +75,15 @@ def main():
 
     parser.add_argument('--attention', action='store_true',
                         help='Enable Tensorboard log of attention masks')
-    parser.add_argument('--embedding', action='store_true', help='Activate embedding visualization in TensorBoard')
-    parser.add_argument('--embeddingint', type=int, help='Embedding visualization interval in TensorBoard',
-                        default=5000)
-
     parser.add_argument('--log_dir', type=str, help='Directory for saving the training logs',
-                        default='runs/triplet/')
+                        default='runs/binclass/')
     parser.add_argument('--models_dir', type=str, help='Directory for saving the models weights',
-                        default='weights/triplet/')
+                        default='weights/binclass/')
 
     args = parser.parse_args()
 
     # Parse arguments
-    net_class = getattr(tripletnet, args.net)
+    net_class = getattr(fornet, args.net)
     train_datasets = args.traindb
     val_datasets = args.valdb
     dfdc_df_path = args.dfdc_faces_df_path
@@ -98,8 +101,8 @@ def main():
     initial_model = args.init
     train_from_scratch = args.scratch
 
-    max_train_triplets = args.traintriplets
-    max_val_triplets = args.valtriplets
+    max_train_samples = args.trainsamples
+    max_val_samples = args.valsamples
 
     log_interval = args.logint
     num_workers = args.workers
@@ -110,8 +113,6 @@ def main():
     suffix = args.suffix
 
     enable_attention = args.attention
-    enable_embedding = args.embedding
-    embedding_interval = args.embeddingint
 
     weights_folder = args.models_dir
     logs_folder = args.log_dir
@@ -121,13 +122,24 @@ def main():
     torch.random.manual_seed(seed)
 
     # Load net
-    net: nn.Module = net_class().to(device)
+    # print(str(net_class))
+    if (args.net == 'Ensemble'):
+        net_models = ['EfficientNetAutoAttB4','EfficientNetAutoAttB4ST', 'Xception']
+        nets = []
+        for net_model in net_models:
+            model_url = weights.weight_url['{:s}_{:s}'.format(net_model,'DFDC')]
+            Net = getattr(fornet,net_model)().eval().to(device)
+            Net.load_state_dict(load_url(model_url,map_location=device,check_hash=True))
+            nets.append(Net)
+        net: nn.Module = net_class(nets,device).to(device)
+    else:
+      net: nn.Module = net_class().to(device)
 
     # Loss and optimizers
-    criterion = nn.TripletMarginLoss()
+    criterion = nn.BCEWithLogitsLoss()
 
     min_lr = initial_lr * 1e-5
-    optimizer = optim.Adam(net.get_trainable_parameters(), lr=initial_lr)
+    optimizer = optim.Adam(net.parameters(), lr=initial_lr)
     lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer=optimizer,
         mode='min',
@@ -136,6 +148,7 @@ def main():
         cooldown=2 * patience,
         min_lr=min_lr,
     )
+    # optimizer = optim.SGD(net.parameters(), lr=0.003, momentum=0.9)
 
     tag = utils.make_train_tag(net_class=net_class,
                                traindb=train_datasets,
@@ -154,7 +167,7 @@ def main():
     os.makedirs(os.path.join(weights_folder, tag), exist_ok=True)
 
     # Load model
-    val_loss = min_val_loss = 20
+    val_loss = min_val_loss = 10
     epoch = iteration = 0
     net_state = None
     opt_state = None
@@ -174,7 +187,6 @@ def main():
         state = torch.load(bestval_path, map_location='cpu')
         min_val_loss = state['val_loss']
     if net_state is not None:
-        adapt_binclass_model(net_state)
         incomp_keys = net.load_state_dict(net_state, strict=False)
         print(incomp_keys)
     if opt_state is not None:
@@ -192,9 +204,10 @@ def main():
     tb = SummaryWriter(logdir=logdir)
     if iteration == 0:
         dummy = torch.randn((1, 3, face_size, face_size), device=device)
+        dummy = dummy.to(device)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            tb.add_graph(net, [dummy, dummy, dummy], verbose=False)
+            # tb.add_graph(net, [dummy, ], verbose=False)
 
     transformer = utils.get_transformer(face_policy=face_policy, patch_size=face_size,
                                         net_normalizer=net.get_normalizer(), train=True)
@@ -212,66 +225,66 @@ def main():
             raise RuntimeError('Specify DataFrame and directory for DFDC faces for validation!')
         elif dataset.split('-')[0] == 'ff' and (ffpp_df_path is None or ffpp_faces_dir is None):
             raise RuntimeError('Specify DataFrame and directory for FF++ faces for validation!')
-    splits = split.make_splits(dfdc_df=dfdc_df_path, ffpp_df=ffpp_df_path, dfdc_dir=dfdc_faces_dir,
-                               ffpp_dir=ffpp_faces_dir, dbs={'train': train_datasets, 'val': val_datasets})
+    # Load splits with the make_splits function
+    splits = split.make_splits(dfdc_df=dfdc_df_path, ffpp_df=ffpp_df_path, dfdc_dir=dfdc_faces_dir, ffpp_dir=ffpp_faces_dir,
+                               dbs={'train': train_datasets, 'val': val_datasets})
     train_dfs = [splits['train'][db][0] for db in splits['train']]
     train_roots = [splits['train'][db][1] for db in splits['train']]
     val_roots = [splits['val'][db][1] for db in splits['val']]
     val_dfs = [splits['val'][db][0] for db in splits['val']]
 
-    train_dataset = FrameFaceTripletIterableDataset(roots=train_roots,
-                                                    dfs=train_dfs,
-                                                    scale=face_policy,
-                                                    num_triplets=max_train_triplets,
-                                                    transformer=transformer,
-                                                    size=face_size,
-                                                    )
+    train_dataset = FrameFaceIterableDataset(roots=train_roots,
+                                             dfs=train_dfs,
+                                             scale=face_policy,
+                                             num_samples=max_train_samples,
+                                             transformer=transformer,
+                                             size=face_size,
+                                             )
 
-    val_dataset = FrameFaceTripletIterableDataset(roots=val_roots,
-                                                  dfs=val_dfs,
-                                                  scale=face_policy,
-                                                  num_triplets=max_val_triplets,
-                                                  transformer=transformer,
-                                                  size=face_size,
-                                                  )
+    val_dataset = FrameFaceIterableDataset(roots=val_roots,
+                                           dfs=val_dfs,
+                                           scale=face_policy,
+                                           num_samples=max_val_samples,
+                                           transformer=transformer,
+                                           size=face_size,
+                                           )
 
     train_loader = DataLoader(train_dataset, num_workers=num_workers, batch_size=batch_size, )
 
     val_loader = DataLoader(val_dataset, num_workers=num_workers, batch_size=batch_size, )
 
-    print('Training triplets: {}'.format(len(train_dataset)))
-    print('Validation triplets: {}'.format(len(val_dataset)))
+    print('Training samples: {}'.format(len(train_dataset)))
+    print('Validation samples: {}'.format(len(val_dataset)))
 
     if len(train_dataset) == 0:
-        print('No training triplets. Halt.')
+        print('No training samples. Halt.')
         return
 
     if len(val_dataset) == 0:
-        print('No validation triplets. Halt.')
+        print('No validation samples. Halt.')
         return
 
-    # Embedding visualization
-    if enable_embedding:
-        train_dataset_embedding = FrameFaceIterableDataset(roots=train_roots,
-                                                           dfs=train_dfs,
-                                                           scale=face_policy,
-                                                           num_samples=64,
-                                                           transformer=transformer,
-                                                           size=face_size,
-                                                           )
-        train_loader_embedding = DataLoader(train_dataset_embedding, num_workers=num_workers, batch_size=batch_size, )
-        val_dataset_embedding = FrameFaceIterableDataset(roots=val_roots,
-                                                         dfs=val_dfs,
-                                                         scale=face_policy,
-                                                         num_samples=64,
-                                                         transformer=transformer,
-                                                         size=face_size,
-                                                         )
-        val_loader_embedding = DataLoader(val_dataset_embedding, num_workers=num_workers, batch_size=batch_size, )
-
-    else:
-        train_loader_embedding = None
-        val_loader_embedding = None
+    # train_losses = []
+    # train_counter = []
+    # test_losses = []
+    # test_counter = [i*len(train_loader.dataset) for i in range(n_epochs + 1)]
+    # def train(epoch):
+    #     net.train()
+    #     for batch_idx, (data, target) in enumerate(train_loader):
+    #         optimizer.zero_grad()
+    #         output = network(data)
+    #         loss = F.nll_loss(output, target)
+    #         loss.backward()
+    #         optimizer.step()
+    #         if batch_idx % log_interval == 0:
+    #             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+    #                 epoch, batch_idx * len(data), len(train_loader.dataset),
+    #                 100. * batch_idx / len(train_loader), loss.item()))
+    #             train_losses.append(loss.item())
+    #             train_counter.append(
+    #                 (batch_idx*64) + ((epoch-1)*len(train_loader.dataset)))
+    #         torch.save(network.state_dict(), '/results/model.pth')
+    #         torch.save(optimizer.state_dict(), '/results/optimizer.pth')
 
     stop = False
     while not stop:
@@ -280,13 +293,19 @@ def main():
         optimizer.zero_grad()
 
         train_loss = train_num = 0
+        train_pred_list = []
+        train_labels_list = []
         for train_batch in tqdm(train_loader, desc='Epoch {:03d}'.format(epoch), leave=False,
                                 total=len(train_loader) // train_loader.batch_size):
             net.train()
-            train_batch_num = len(train_batch[0])
-            train_num += train_batch_num
+            batch_data, batch_labels = train_batch
 
-            train_batch_loss = batch_forward(net, device, criterion, train_batch)
+            train_batch_num = len(batch_labels)
+            train_num += train_batch_num
+            train_labels_list.append(batch_labels.numpy().flatten())
+
+            train_batch_loss, train_batch_pred = batch_forward(net, device, criterion, batch_data, batch_labels)
+            train_pred_list.append(train_batch_pred.flatten())
 
             if torch.isnan(train_batch_loss):
                 raise ValueError('NaN loss')
@@ -312,25 +331,36 @@ def main():
             # Validation
             if iteration > 0 and (iteration % validation_interval == 0):
 
+                # Model checkpoint
+                save_model(net, optimizer, train_loss, val_loss, iteration, batch_size, epoch,
+                           periodic_path.format(iteration))
+
+                # Train cumulative stats
+                train_labels = np.concatenate(train_labels_list)
+                train_pred = np.concatenate(train_pred_list)
+                train_labels_list = []
+                train_pred_list = []
+
+                train_roc_auc = roc_auc_score(train_labels, train_pred)
+                tb.add_scalar('train/roc_auc', train_roc_auc, iteration)
+                tb.add_pr_curve('train/pr', train_labels, train_pred, iteration)
+
                 # Validation
-                val_loss = validation_routine(net, device, val_loader, criterion, tb, iteration, tag='val')
+                val_loss = validation_routine(net, device, val_loader, criterion, tb, iteration, 'val')
                 tb.flush()
 
                 # LR Scheduler
                 lr_scheduler.step(val_loss)
 
                 # Model checkpoint
-                save_model(net, optimizer, train_loss, val_loss, iteration, batch_size, epoch,
-                           periodic_path.format(iteration))
                 if val_loss < min_val_loss:
                     min_val_loss = val_loss
-                    shutil.copy(periodic_path.format(iteration), bestval_path)
+                    save_model(net, optimizer, train_loss, val_loss, iteration, batch_size, epoch, bestval_path)
 
                 # Attention
-                if enable_attention and hasattr(net, 'feat_ext') and hasattr(net.feat_ext, 'get_attention'):
+                if enable_attention and hasattr(net, 'get_attention'):
                     net.eval()
                     # For each dataframe show the attention for a real,fake couple of frames
-
                     for df, root, sample_idx, tag in [
                         (train_dfs[0], train_roots[0], train_dfs[0][train_dfs[0]['label'] == False].index[0],
                          'train/att/real'),
@@ -338,29 +368,13 @@ def main():
                          'train/att/fake'),
                     ]:
                         record = df.loc[sample_idx]
-                        tb_attention(tb, tag, iteration, net.feat_ext, device, face_size, face_policy,
+                        tb_attention(tb, tag, iteration, net, device, face_size, face_policy,
                                      transformer, root, record)
 
-                if optimizer.param_groups[0]['lr'] <= min_lr:
+                if optimizer.param_groups[0]['lr'] == min_lr:
                     print('Reached minimum learning rate. Stopping.')
                     stop = True
                     break
-
-            # Embedding visualization
-            if enable_embedding:
-                if iteration > 0 and (iteration % embedding_interval == 0):
-                    embedding_routine(net=net,
-                                      device=device,
-                                      loader=train_loader_embedding,
-                                      iteration=iteration,
-                                      tb=tb,
-                                      tag=tag + '/train')
-                    embedding_routine(net=net,
-                                      device=device,
-                                      loader=val_loader_embedding,
-                                      iteration=iteration,
-                                      tb=tb,
-                                      tag=tag + '/val')
 
             iteration += 1
 
@@ -379,39 +393,62 @@ def main():
     print('Completed')
 
 
-def adapt_binclass_model(net_state):
-    # Check that the model contains at least one key starting with feat_ext, otherwise adapt
-    found = False
-    for key in net_state:
-        if key.startswith('feat_ext.'):
-            found = True
-            break
-    if not found:
-        # Adapt all keys
-        print('Adapting keys')
-        keys = [k for k in net_state]
-        for key in keys:
-            net_state['feat_ext.{}'.format(key)] = net_state[key]
-            del net_state[key]
-
-
-def batch_forward(net: nn.Module, device, criterion, data: tuple) -> torch.Tensor:
+def tb_attention(tb: SummaryWriter,
+                 tag: str,
+                 iteration: int,
+                 net: nn.Module,
+                 device: torch.device,
+                 patch_size_load: int,
+                 face_crop_scale: str,
+                 val_transformer: A.BasicTransform,
+                 root: str,
+                 record: pd.Series,
+                 ):
+    # Crop face
+    sample_t = load_face(record=record, root=root, size=patch_size_load, scale=face_crop_scale,
+                         transformer=val_transformer)
+    sample_t_clean = load_face(record=record, root=root, size=patch_size_load, scale=face_crop_scale,
+                               transformer=ToTensorV2())
     if torch.cuda.is_available():
-        data = [i.cuda(device) for i in data]
-    out = net(*data)
-    loss = criterion(*out)
-    return loss
+        sample_t = sample_t.cuda(device)
+    # Transform
+    # Feed to net
+    with torch.no_grad():
+        att: torch.Tensor = net.get_attention(sample_t.unsqueeze(0))[0].cpu()
+    att_img: Image.Image = ToPILImage()(att)
+    sample_img = ToPILImage()(sample_t_clean)
+    att_img = att_img.resize(sample_img.size, resample=Image.NEAREST).convert('RGB')
+    sample_att_img = ImageChops.multiply(sample_img, att_img)
+    sample_att = ToTensor()(sample_att_img)
+    tb.add_image(tag=tag, img_tensor=sample_att, global_step=iteration)
 
 
-def validation_routine(net, device, val_loader, criterion, tb, iteration, tag):
+def batch_forward(net: nn.Module, device: torch.device, criterion, data: torch.Tensor, labels: torch.Tensor) -> (
+        torch.Tensor, float, int):
+    data = data.to(device)
+    labels = labels.to(device)
+    out = net(data)
+    pred = torch.sigmoid(out).detach().cpu().numpy()
+    loss = criterion(out, labels)
+    return loss, pred
+
+
+def validation_routine(net, device, val_loader, criterion, tb, iteration, tag: str, loader_len_norm: int = None):
     net.eval()
-
+    loader_len_norm = loader_len_norm if loader_len_norm is not None else val_loader.batch_size
     val_num = 0
     val_loss = 0.
-    for val_data in tqdm(val_loader, desc='Validation', leave=False, total=len(val_loader) // val_loader.batch_size):
-        val_batch_num = len(val_data[0])
+    pred_list = list()
+    labels_list = list()
+    for val_data in tqdm(val_loader, desc='Validation', leave=False, total=len(val_loader) // loader_len_norm):
+        batch_data, batch_labels = val_data
+
+        val_batch_num = len(batch_labels)
+        labels_list.append(batch_labels.flatten())
         with torch.no_grad():
-            val_batch_loss = batch_forward(net, device, criterion, val_data, )
+            val_batch_loss, val_batch_pred = batch_forward(net, device, criterion, batch_data,
+                                                           batch_labels)
+        pred_list.append(val_batch_pred.flatten())
         val_num += val_batch_num
         val_loss += val_batch_loss.item() * val_batch_num
 
@@ -419,29 +456,29 @@ def validation_routine(net, device, val_loader, criterion, tb, iteration, tag):
     val_loss /= val_num
     tb.add_scalar('{}/loss'.format(tag), val_loss, iteration)
 
+    if isinstance(criterion, nn.BCEWithLogitsLoss):
+        val_labels = np.concatenate(labels_list)
+        val_pred = np.concatenate(pred_list)
+        val_roc_auc = roc_auc_score(val_labels, val_pred)
+        tb.add_scalar('{}/roc_auc'.format(tag), val_roc_auc, iteration)
+        tb.add_pr_curve('{}/pr'.format(tag), val_labels, val_pred, iteration)
+
     return val_loss
 
 
-def embedding_routine(net: nn.Module, device: torch.device, loader: DataLoader, tb: SummaryWriter, iteration: int,
-                      tag: str):
-    net.eval()
-
-    labels = []
-    embeddings = []
-    for batch_data in loader:
-        batch_faces, batch_labels = batch_data
-        if torch.cuda.is_available():
-            batch_faces = batch_faces.to(device)
-        with torch.no_grad():
-            batch_emb = net.features(batch_faces)
-        labels.append(batch_labels.numpy().flatten())
-        embeddings.append(torch.flatten(batch_emb.cpu(), start_dim=1).numpy())
-
-    labels = list(np.concatenate(labels))
-    embeddings = np.concatenate(embeddings)
-
-    # Logging
-    tb.add_embedding(mat=embeddings, metadata=labels, tag=tag, global_step=iteration)
+def save_model(net: nn.Module, optimizer: optim.Optimizer,
+               train_loss: float, val_loss: float,
+               iteration: int, batch_size: int, epoch: int,
+               path: str):
+    path = str(path)
+    state = dict(net=net.state_dict(),
+                 opt=optimizer.state_dict(),
+                 train_loss=train_loss,
+                 val_loss=val_loss,
+                 iteration=iteration,
+                 batch_size=batch_size,
+                 epoch=epoch)
+    torch.save(state, path)
 
 
 if __name__ == '__main__':
